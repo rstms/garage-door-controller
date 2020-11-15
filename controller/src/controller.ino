@@ -1,16 +1,15 @@
 /*
-  Adapted from PubSub Library Basic ESP8266 MQTT example
 
-  To install the ESP8266 board, (using Arduino 1.6.4+):
-  - Add the following 3rd party board manager under "File -> Preferences -> Additional Boards Manager URLs":
-       http://arduino.esp8266.com/stable/package_esp8266com_index.json
-  - Open the "Tools -> Board -> Board Manager" and click install for the ESP8266"
-  - Select your ESP8266 in "Tools -> Board"
+  RSTMS IOT MVP -- Garage Door Controller
 
-  Connects to MQTT server, pulses garage door switch, publishes door closed sensor state
+  - Connects to MQTT server 
+  - pulse garage door switch on command
+  - publishes door sensor state
+  - hardware reset on command
 
   subscribes:
    TOPIC/button
+   TOPIC/reset
    TOPIC/state_enable
 
   publishes:
@@ -19,13 +18,12 @@
    TOPIC/state_enable (initializes to 1)
    TOPIC/state (transmitted every 2 seconds when state_enable==1)
 
-
-  serial-port-sensor
-  ------------------
-   Disable Serial Port I/O - instead use serial port to sense door switch
-   (connect door switch between GND and RX pins)
-   set RX as INPUT_PULLUP
-   read RX value as status - 0 == RX is shorted to GND
+  door-position-sensor
+  --------------------
+   Pins GPIO12 and GPIO14 are configured as inputs with a pull-up resistor.
+   Each pin is connected through a magnetic switch to GND.
+   A magnet attached to the door causes switch closure when the door is fully open or closed.
+   A LOW input indicates the presence of the magnet.
 
 */
 
@@ -40,25 +38,33 @@ PubSubClient client(espClient);
 String topic_button_command(MQTT_TOPIC("button"));
 String topic_state_enable(MQTT_TOPIC("state_enable"));
 String topic_reset(MQTT_TOPIC("reset"));
-int state_enable = 1;
-long publish_state_time = 0;
-long startup_time = 0;
+byte state_enable = 1;
+unsigned long publish_state_time = 0;
+unsigned long startup_time = 0;
+unsigned long reset_pending = 0;
 
+// sensor state change flag
+volatile byte sensor_changed = 0;
 
 void setup() {
 
-  // first set the reset pin high so we don't reset ourselves
-  digitalWrite(RESET_PIN, HIGH);
+  // first set the reset pin HIGH so we don't reset ourselves
   pinMode(RESET_PIN, OUTPUT);
+  digitalWrite(RESET_PIN, HIGH);
 
   // make sure the relay is de-energized
-  digitalWrite(RELAY_PIN, LOW);
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
   
   startup_time = millis();
 
+  // setup sensor 0
   pinMode(SENSOR0_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SENSOR0_PIN), sensor_isr, CHANGE);
+
+  // setup sensor 1 
   pinMode(SENSOR1_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SENSOR1_PIN), sensor_isr, CHANGE);
 
   Serial.begin(115200);
 
@@ -72,6 +78,10 @@ void setup() {
   digitalWrite(LED_BUILTIN, HIGH); // turn LED off- setup done
 }
 
+void ICACHE_RAM_ATTR sensor_isr() {
+  sensor_changed = 1;
+}
+
 void loop() {
 
   if (!client.connected()) {
@@ -81,27 +91,56 @@ void loop() {
   // timeslice for MQTT client
   client.loop();
 
-  if (state_enable && (millis() - publish_state_time > OUTPUT_INTERVAL)) {
-    int sensor0 = digitalRead(SENSOR0_PIN);
-    int sensor1 = digitalRead(SENSOR1_PIN);
-    const char *state = "Active";
+  // subroutines request future hard_reset by setting millis() value into reset_pending
+  if(reset_pending) {
+    if(millis() >= reset_pending)
+    {
+      publish_state("state", "Reset");
+      hard_reset();
+    }
+  }
+
+  if (sensor_changed)
+  {
+    Serial.println("Sensor Change Detected.");
+  }
+  
+  if (state_enable && (millis() - publish_state_time > OUTPUT_INTERVAL))
+  {
+    Serial.println("Timed Sensor Output Triggered.");
+    sensor_changed = 1;
+  }
+
+  if(sensor_changed)
+  {
+    byte sensor0 = digitalRead(SENSOR0_PIN);
+    byte sensor1 = digitalRead(SENSOR1_PIN);
+    const char *state = "Error";
 
     Serial.print("sensor0=");
     Serial.println(sensor0 ? "1" : "0");
     Serial.print("sensor1=");
     Serial.println(sensor1 ? "1" : "0");
 
-    if (sensor0==0) {
+    if (sensor0 && sensor1)
+    {
+      state = "Active";
+    }
+    else if (!sensor0 && sensor1)
+    {
       state = "Open";
     }
-
-    if (sensor1==0) {
+    else if (sensor0 && !sensor1)
+    {
       state = "Closed";
     }
 
     publish_state("state", state);
+    sensor_changed = 0;
   }
 }
+
+
 
 void setup_wifi() {
 
@@ -129,7 +168,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("[");
   Serial.print(topic);
   Serial.print("] ");
-  for (int i = 0; i < length; i++) {
+  for (unsigned int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
   }
   Serial.println();
@@ -150,10 +189,19 @@ void callback(char* topic, byte* payload, unsigned int length) {
     state_enable = (char)payload[0] == '1';
   }
   else if (!topic_reset.compareTo(topic)) {
-    publish_state("reset", "0");
-    publish_state("state", "Reset");
-    delay(OUTPUT_INTERVAL);
-    hard_reset();
+    if ((char)payload[0] == '1')
+    {
+      if(!reset_pending)
+      {
+        Serial.println("Reset Pending...");
+        publish_state("state", "Reset");
+        reset_pending = millis() + OUTPUT_INTERVAL;
+      }
+    }
+    else if ((char)payload[0] == '0')
+    {
+        Serial.println("Reset cleared.");
+    }
   }
 }
 
@@ -174,20 +222,20 @@ void reconnect() {
       client.subscribe(topic_state_enable.c_str());
       client.subscribe(topic_reset.c_str());
 
-      // publish an announcement...
+      // publish startup announcement...
       client.publish(MQTT_TOPIC("startup"), clientId.c_str());
       
       // publish to initialize the button state and state enable
       client.publish(topic_button_command.c_str(), "0");
       client.publish(topic_state_enable.c_str(), "1");
+      client.publish(topic_reset.c_str(), "0");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
       // if we've been running for longer than WATCHDOG_TIMEOUT without a connection, reboot
       if ((millis() - startup_time) > WATCHDOG_TIMEOUT) {
-        Serial.println("Watchdog timer expired.  Geronimo!");
+        Serial.println("Watchdog timer expired.");
         hard_reset();
-        Serial.println("reset failed");
       } else {
         // Wait 5 seconds before retrying
         Serial.println(" try again in 5 seconds");
@@ -209,6 +257,7 @@ void publish_state(const char *topic, const char *state) {
 }
 
 void hard_reset() {      
+  Serial.println("hard_reset: Geronimo!");
   digitalWrite(RESET_PIN, LOW);
-  delay(3000);
+  Serial.println("hard_reset: failure");
 }
